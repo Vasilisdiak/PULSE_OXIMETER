@@ -1,1 +1,1 @@
-To Pulse_Oximeter einai to full build final project/program.
+Το Pulse_Oximeter είναι το full build final project/program.
