@@ -1,280 +1,145 @@
+#include "driver/rmt.h"
 #include <Arduino.h>
 
 // =============================================================
 // -------------------- PIN DEFINITIONS ------------------------
 // =============================================================
-
-// --- LED OUTPUTS (4-Wire Setup) ---
-#define PIN_IR_WIN     19 
-#define PIN_RED_WIN    5  
-#define PIN_IR_PWM     18 
-#define PIN_RED_PWM    17 
-
-// --- ADC INPUTS ---
-#define PIN_ADC_DC     34 // sPH: Raw DC signal (with PWM ripple)
-#define PIN_ADC_AC     35 // G Sr_ac: AC signal (Offset ~2.5V)
+#define PIN_IR_WIN    22 
+#define PIN_IR_PWM    15
+#define PIN_RED_WIN   19
+#define PIN_RED_PWM   14
 
 // =============================================================
-// ------------------- CONSTANTS & SETTINGS --------------------
+// ------------------- TIMING SETTINGS -------------------------
 // =============================================================
+#define FSM_TICK_US     500   // 500us Window
+#define RMT_CLK_DIV     80    // 1us resolution
 
-// --- Timing ---
-#define SLOT_PERIOD_US  500  
+// FIXED FREQUENCY SETTINGS (50kHz)
+#define CARRIER_PERIOD  20    // 20us = 50kHz
+#define NUM_PULSES      25    // 25 * 20us = 500us (Fills the window)
 
-// --- PWM Settings (20kHz) ---
-#define PWM_FREQ        20000
-#define PWM_RES_BITS    8    
-
-// --- Calibration Targets ---
-// Target: 2.0V (~2480 ADC).
-// Safe Range: 0.5V (~620) to 3.0V (~3720).
-// 2.0V is chosen to be safely in the middle of your 0.5V-3.0V requirement.
-#define DC_TARGET_VAL   2480 
-#define DC_TOLERANCE    100  
-#define PWM_START_DUTY  50   
-#define PWM_MAX_DUTY    240  
-#define PWM_MIN_DUTY    10   
-
-// --- Averaging Settings ---
-// We take N samples quickly inside the ISR to average out the 20kHz PWM ripple.
-// 20kHz period = 50us. 8 ADC reads takes ~100-150us, covering 2-3 PWM cycles.
-#define NUM_SAMPLES_AVG 8 
-
-// --- Filter Constants ---
-float alpha_hp = 0.9968;
-float a0_lp = 0.000241, a1_lp = 0.000482, a2_lp = 0.000241;
-float b1_lp = -1.955578, b2_lp = 0.956544;
+// Channels
+#define CH_IR_WIN   RMT_CHANNEL_0
+#define CH_IR_PWM   RMT_CHANNEL_1
+#define CH_RED_WIN  RMT_CHANNEL_2
+#define CH_RED_PWM  RMT_CHANNEL_3
 
 // =============================================================
-// ---------------------- GLOBAL VARIABLES ---------------------
+// ------------------ GLOBAL BUFFERS ---------------------------
 // =============================================================
+rmt_item32_t items_window[2];          
+rmt_item32_t items_pwm[NUM_PULSES + 1]; 
 
-enum SystemState { STATE_INIT, STATE_CALIBRATING, STATE_MEASURING };
-volatile SystemState currentState = STATE_INIT;
-
-volatile int irDuty = PWM_START_DUTY;
-volatile int redDuty = PWM_START_DUTY;
-volatile int timingPhase = 0; 
-
-// Accumulators for the slow loop (averaged over many frames)
-volatile long sumDC_IR = 0;
-volatile long sumDC_Red = 0;
-volatile int sampleCountDC = 0;
-
-int avgDC_IR = 0;
-int avgDC_Red = 0;
-
-struct FilterState {
-  float x_hp_old=0, y_hp_old=0;
-  float x1_lp=0, x2_lp=0, y1_lp=0, y2_lp=0;
-  float filteredOutput=0;
-  bool  initialized=false; 
-};
-volatile FilterState filterIR, filterRed;
-
+// FSM State
+volatile int fsm_state = 0;
 hw_timer_t * timer = NULL;
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 
 // =============================================================
-// -------------------- ISR & FILTER FUNCTIONS -----------------
+// --------------- DUTY CYCLE FUNCTION -------------------------
 // =============================================================
 
-void runFilter(volatile FilterState &fs, float rawInput) {
-  // Seed filter if new (handle 2.5V AC offset)
-  if (!fs.initialized) {
-    fs.x_hp_old = rawInput;
-    fs.y_hp_old = 0;
-    fs.x1_lp = 0; fs.x2_lp = 0; 
-    fs.y1_lp = 0; fs.y2_lp = 0;
-    fs.initialized = true;
-    return; 
-  }
+/**
+ * @brief Sets the brightness (PWM Duty Cycle).
+ * @param dutyPercent Value from 0 to 100.
+ */
+void setDutyCycle(int dutyPercent) {
+    // 1. Clamp input to safe range (5% to 95% to avoid signal loss)
+    if (dutyPercent < 5) dutyPercent = 5;
+    if (dutyPercent > 95) dutyPercent = 95;
 
-  // 1. HPF
-  float y_hp = alpha_hp * (fs.y_hp_old + rawInput - fs.x_hp_old);
-  fs.x_hp_old = rawInput;
-  fs.y_hp_old = y_hp;
+    // 2. Calculate ON and OFF times
+    // For 50kHz (20us period):
+    // 50% -> 10us High, 10us Low
+    // 20% -> 4us High, 16us Low
+    int high_us = (CARRIER_PERIOD * dutyPercent) / 100;
+    int low_us  = CARRIER_PERIOD - high_us;
 
-  // 2. LPF
-  float y_lp = a0_lp * y_hp + a1_lp * fs.x1_lp + a2_lp * fs.x2_lp - b1_lp * fs.y1_lp - b2_lp * fs.y2_lp;
-  fs.x2_lp = fs.x1_lp; fs.x1_lp = y_hp;
-  fs.y2_lp = fs.y1_lp; fs.y1_lp = y_lp;
-
-  fs.filteredOutput = y_lp;
+    // 3. Update the PWM Buffer
+    // We rewrite the "shape" of all 25 pulses in the array
+    for(int i=0; i < NUM_PULSES; i++) {
+        items_pwm[i] = {{{ (uint16_t)high_us, 1, (uint16_t)low_us, 0 }}};
+    }
+    // Ensure End Marker is present
+    items_pwm[NUM_PULSES] = {{{ 0, 0, 0, 0 }}}; 
+    
+    // 4. Update the Window Buffer (This stays constant, but good to init here)
+    items_window[0] = {{{ 500, 1, 0, 0 }}}; 
+    items_window[1] = {{{ 0, 0, 0, 0 }}}; 
 }
 
-// Helper to perform burst sampling inside ISR
-int readAverageDC() {
-  long burstSum = 0;
-  for (int i = 0; i < NUM_SAMPLES_AVG; i++) {
-    burstSum += analogRead(PIN_ADC_DC);
-  }
-  return (int)(burstSum / NUM_SAMPLES_AVG);
+// =============================================================
+// ---------------- SETUP: RMT CONFIG --------------------------
+// =============================================================
+void setupRMT() {
+    rmt_config_t config = {};
+    config.rmt_mode = RMT_MODE_TX;
+    config.clk_div = RMT_CLK_DIV;
+    config.mem_block_num = 1;
+    
+    config.tx_config.loop_en = false; 
+    config.tx_config.carrier_en = false; 
+    config.tx_config.idle_output_en = true;
+    config.tx_config.idle_level = RMT_IDLE_LEVEL_LOW;
+
+    // Configure all 4 channels
+    config.channel = CH_IR_WIN;  config.gpio_num = (gpio_num_t)PIN_IR_WIN; rmt_config(&config); rmt_driver_install(config.channel, 0, 0);
+    config.channel = CH_IR_PWM;  config.gpio_num = (gpio_num_t)PIN_IR_PWM; rmt_config(&config); rmt_driver_install(config.channel, 0, 0);
+    config.channel = CH_RED_WIN; config.gpio_num = (gpio_num_t)PIN_RED_WIN; rmt_config(&config); rmt_driver_install(config.channel, 0, 0);
+    config.channel = CH_RED_PWM; config.gpio_num = (gpio_num_t)PIN_RED_PWM; rmt_config(&config); rmt_driver_install(config.channel, 0, 0);
 }
 
+// =============================================================
+// ------------------- THE FSM INTERRUPT -----------------------
+// =============================================================
 void IRAM_ATTR onTimerISR() {
-  int currentDC, rawAC;
+    switch (fsm_state) {
+        case 0: // === IR PHASE ===
+            rmt_write_items(CH_IR_WIN, items_window, 2, false); 
+            rmt_write_items(CH_IR_PWM, items_pwm, NUM_PULSES + 1, false);
+            break;
 
-  portENTER_CRITICAL_ISR(&timerMux);
+        case 1: // === WAIT ===
+            break;
 
-  switch (timingPhase) {
-    case 0: // IR WINDOW
-      digitalWrite(PIN_IR_WIN, HIGH);
-      
-      // NEW: Take 8 samples and average them immediately
-      // This smoothes out the PWM ripple you described
-      currentDC = readAverageDC();
-      sumDC_IR += currentDC;
-      
-      if (currentState == STATE_MEASURING) {
-        rawAC = analogRead(PIN_ADC_AC);
-        runFilter(filterIR, rawAC / 4095.0);
-      }
-      break;
+        case 2: // === RED PHASE ===
+            rmt_write_items(CH_RED_WIN, items_window, 2, false);
+            rmt_write_items(CH_RED_PWM, items_pwm, NUM_PULSES + 1, false);
+            break;
 
-    case 1: // DARK
-      digitalWrite(PIN_IR_WIN, LOW);
-      break;
-
-    case 2: // RED WINDOW
-      digitalWrite(PIN_RED_WIN, HIGH);
-      
-      // NEW: Take 8 samples and average them immediately
-      currentDC = readAverageDC();
-      sumDC_Red += currentDC;
-      
-      if (currentState == STATE_MEASURING) {
-        rawAC = analogRead(PIN_ADC_AC);
-        runFilter(filterRed, rawAC / 4095.0);
-      }
-      break;
-
-    case 3: // DARK
-      digitalWrite(PIN_RED_WIN, LOW);
-      sampleCountDC++;
-      break;
-  }
-
-  timingPhase = (timingPhase + 1) % 4;
-  portEXIT_CRITICAL_ISR(&timerMux);
+        case 3: // === WAIT ===
+            break;
+    }
+    fsm_state = (fsm_state + 1) % 4;
 }
 
 // =============================================================
-// ----------------------- SETUP -------------------------------
+// ----------------------- MAIN SETUP --------------------------
 // =============================================================
 void setup() {
-  Serial.begin(115200);
-  Serial.println("System Init...");
+    Serial.begin(115200);
+    
+    // Initialize RMT
+    setupRMT();
+    
+    // --- SET INITIAL DUTY CYCLE HERE ---
+    setDutyCycle(20); // Example: Start at 20% Brightness
 
-  pinMode(PIN_IR_WIN, OUTPUT);
-  pinMode(PIN_RED_WIN, OUTPUT);
-  digitalWrite(PIN_IR_WIN, LOW);
-  digitalWrite(PIN_RED_WIN, LOW);
-  
-  analogReadResolution(12);
-  analogSetAttenuation(ADC_11db);
+    // Start Timer
+    timer = timerBegin(1000000); 
+    timerAttachInterrupt(timer, &onTimerISR);
+    timerAlarm(timer, FSM_TICK_US, true, 0); 
 
-  // --- PWM SETUP ---
-  ledcAttach(PIN_IR_PWM, PWM_FREQ, PWM_RES_BITS);
-  ledcAttach(PIN_RED_PWM, PWM_FREQ, PWM_RES_BITS);
-  ledcWrite(PIN_IR_PWM, irDuty);
-  ledcWrite(PIN_RED_PWM, redDuty);
-
-  // --- TIMER SETUP ---
-  timer = timerBegin(1000000); 
-  timerAttachInterrupt(timer, &onTimerISR);
-  timerAlarm(timer, SLOT_PERIOD_US, true, 0);
-
-  delay(1000);
-  currentState = STATE_CALIBRATING;
-  Serial.println("Starting Calibration...");
-}
-
-// =============================================================
-// ----------------------- MAIN LOOP ---------------------------
-// =============================================================
-
-int adjustDuty(int currentDuty, int target, int actual) {
-  int step = 1;
-  // Increase step size if far from target
-  if (abs(target - actual) > 500) step = 5; else step = 1;
-  
-  if (actual < (target - DC_TOLERANCE)) currentDuty += step; 
-  else if (actual > (target + DC_TOLERANCE)) currentDuty -= step; 
-  return constrain(currentDuty, PWM_MIN_DUTY, PWM_MAX_DUTY);
+    Serial.println("System Running. Duty Cycle Variable Ready.");
 }
 
 void loop() {
-  static unsigned long lastDebugUpdate = 0;
-  static unsigned long lastCalibUpdate = 0;
-
-  // Process data every 100ms
-  if (millis() - lastCalibUpdate > 100) {
-    lastCalibUpdate = millis();
-    if (sampleCountDC > 0) {
-      portENTER_CRITICAL(&timerMux);
-      avgDC_IR = sumDC_IR / sampleCountDC;
-      avgDC_Red = sumDC_Red / sampleCountDC;
-      sumDC_IR = 0; sumDC_Red = 0; sampleCountDC = 0;
-      portEXIT_CRITICAL(&timerMux);
-    }
-  }
-
-  switch (currentState) {
-    case STATE_CALIBRATING:
-      {
-        int newIrDuty = adjustDuty(irDuty, DC_TARGET_VAL, avgDC_IR);
-        if (newIrDuty != irDuty) {
-          irDuty = newIrDuty;
-          ledcWrite(PIN_IR_PWM, irDuty);
-        }
-
-        int newRedDuty = adjustDuty(redDuty, DC_TARGET_VAL, avgDC_Red);
-        if (newRedDuty != redDuty) {
-          redDuty = newRedDuty;
-          ledcWrite(PIN_RED_PWM, redDuty);
-        }
-
-        // Check if both signals are close to 2.0V (Target 2480)
-        // This ensures they are inside your 0.5V - 3.0V requirement.
-        if (abs(DC_TARGET_VAL - avgDC_IR) < DC_TOLERANCE && 
-            abs(DC_TARGET_VAL - avgDC_Red) < DC_TOLERANCE) {
-          
-          Serial.println("Calibration Complete!");
-          portENTER_CRITICAL(&timerMux);
-          filterIR.initialized = false;
-          filterRed.initialized = false;
-          portEXIT_CRITICAL(&timerMux);
-          currentState = STATE_MEASURING;
-        }
-      }
-      break;
-
-    case STATE_MEASURING:
-      // If signal goes out of the 0.5V-3.0V range (drift), recalibrate.
-      // 2480 +/- 300 is roughly 1.7V to 2.3V safe zone.
-      // If it hits rails (0.5V or 3.0V), definitely recalibrate.
-      if (abs(DC_TARGET_VAL - avgDC_IR) > 400 || 
-          abs(DC_TARGET_VAL - avgDC_Red) > 400) {
-         Serial.println("Signal Drift. Recalibrating...");
-         currentState = STATE_CALIBRATING;
-      }
-      break;
-  }
-
-  if (millis() - lastDebugUpdate > 500) {
-    lastDebugUpdate = millis();
-    if (currentState == STATE_CALIBRATING) {
-      Serial.print("[CALIB] Target:"); Serial.print(DC_TARGET_VAL);
-      Serial.print(" | IR DC:"); Serial.print(avgDC_IR);
-      Serial.print(" | Red DC:"); Serial.println(avgDC_Red);
-    } 
-    else if (currentState == STATE_MEASURING) {
-      // Plot the AC Heartbeat
-      Serial.print("AC_Signal:");
-      Serial.print(filterIR.filteredOutput * 1000); 
-      Serial.print(",");
-      Serial.println(filterRed.filteredOutput * 1000);
-    }
-  }
+    // Example: Manual Change
+    // You can just call setDutyCycle(x) whenever you need to update it.
+    delay(2000);
+    setDutyCycle(50); // Jump to 50%
+    delay(2000);
+    setDutyCycle(10); // Drop to 10%
+    
+    delay(100);
 }

@@ -1,166 +1,138 @@
 #include "driver/rmt.h"
 #include <Arduino.h>
 
-// ---------------- PIN ASSIGNMENTS ----------------
-#define PIN_PIR 5
-#define PIN_CIR 15
-#define PIN_PR 19
-#define PIN_CR 14
+// =============================================================
+// -------------------- PIN DEFINITIONS ------------------------
+// =============================================================
+#define PIN_PIR     22
+#define PIN_CIR     15
+#define PIN_PR      19
+#define PIN_CR      14
 
-// ------------ CONSTANTS FOR ALL CHANNELS ------------
-const int PERIOD_US = 2000;       // 2 ms frame
-const int DUTY_US   = 500;        // 500 us high for PWM
-const int CARRIER_PERIOD_US = 50; // 20 kHz = 50us
-const int NUM_PULSES = 10;
-const int START_DELAY_US = 1000;
-const int END_DELAY_US   = 500;
+// =============================================================
+// ------------------- TIMING SETTINGS -------------------------
+// =============================================================
+// The "Beat" of our FSM. 500us active, 500us dead.
+#define FSM_TICK_US     500 
 
-// Fixed 50% duty cycle
-const int high_us = CARRIER_PERIOD_US / 2; // 25 µs
-const int low_us  = CARRIER_PERIOD_US / 2; // 25 µs
+// Carrier Wave Settings (50kHz)
+#define RMT_CLK_DIV     80   // 1us resolution
+// NEW: 20us Period = 50kHz
+#define CARRIER_PERIOD  20   
+// NEW: 25 pulses * 20us = 500us (Fills the window perfectly)
+#define NUM_PULSES      25   
 
-// ------------- FIRST PROGRAM BUFFERS -------------
-const int MAX_CYCLES = DUTY_US / CARRIER_PERIOD_US;
-rmt_item32_t pir_item[1];
-rmt_item32_t cir_items[MAX_CYCLES + 1];
+// RMT Channels
+#define CH_PIR  RMT_CHANNEL_0
+#define CH_CIR  RMT_CHANNEL_1
+#define CH_PR   RMT_CHANNEL_2 
+#define CH_CR   RMT_CHANNEL_3
 
-// ------------- SECOND PROGRAM BUFFERS -------------
-rmt_item32_t pr_items[2];
-rmt_item32_t cr_items[NUM_PULSES + 1];
+// =============================================================
+// ------------------ MANUAL BUFFERS ---------------------------
+// =============================================================
+// Buffers for the "Window" (Solid HIGH)
+rmt_item32_t manual_window_item[2];
 
+// Buffers for the "Carrier" (PWM Pulses)
+rmt_item32_t manual_pwm_items[NUM_PULSES + 1];
+
+// FSM State Variable
+volatile int fsm_state = 0;
+hw_timer_t * timer = NULL;
+
+// =============================================================
+// ---------------- SETUP: MANUAL BUFFER FILL ------------------
+// =============================================================
+void fillManualBuffers() {
+    // 1. Define the "Window" Signal (Solid HIGH for 500us)
+    manual_window_item[0] = {{{ 500, 1, 0, 0 }}}; 
+    manual_window_item[1] = {{{ 0, 0, 0, 0 }}}; // End Marker
+
+    // 2. Define the "PWM" Signal (25 pulses of 50kHz)
+    // 50kHz = 20us Period -> 10us High, 10us Low
+    int high_t = 10; 
+    int low_t  = 10; 
+
+    for(int i=0; i<NUM_PULSES; i++) {
+        // Manually constructing the pulse: 10us High, 10us Low
+        manual_pwm_items[i] = {{{ (uint16_t)high_t, 1, (uint16_t)low_t, 0 }}};
+    }
+    // End Marker
+    manual_pwm_items[NUM_PULSES] = {{{ 0, 0, 0, 0 }}}; 
+}
+
+// =============================================================
+// ---------------- SETUP: RMT DRIVER --------------------------
+// =============================================================
+void setupRMT() {
+    rmt_config_t config = {};
+    config.rmt_mode = RMT_MODE_TX;
+    config.clk_div = RMT_CLK_DIV;
+    config.mem_block_num = 1;
+    
+    // CRITICAL: We do NOT loop in hardware. We fire once when told.
+    config.tx_config.loop_en = false; 
+    config.tx_config.carrier_en = false; 
+    config.tx_config.idle_output_en = true;
+    config.tx_config.idle_level = RMT_IDLE_LEVEL_LOW;
+
+    // Configure all 4 channels
+    config.channel = CH_PIR; config.gpio_num = (gpio_num_t)PIN_PIR; rmt_config(&config); rmt_driver_install(CH_PIR, 0, 0);
+    config.channel = CH_CIR; config.gpio_num = (gpio_num_t)PIN_CIR; rmt_config(&config); rmt_driver_install(CH_CIR, 0, 0);
+    config.channel = CH_PR;  config.gpio_num = (gpio_num_t)PIN_PR;  rmt_config(&config); rmt_driver_install(CH_PR, 0, 0);
+    config.channel = CH_CR;  config.gpio_num = (gpio_num_t)PIN_CR;  rmt_config(&config); rmt_driver_install(CH_CR, 0, 0);
+}
+
+// =============================================================
+// ------------------- THE FSM INTERRUPT -----------------------
+// =============================================================
+void IRAM_ATTR onTimerISR() {
+    // This ISR runs exactly every 500us.
+    
+    switch (fsm_state) {
+        case 0: // === IR PHASE ===
+            // Fire IR Window and IR PWM immediately
+            rmt_write_items(CH_PIR, manual_window_item, 2, false); 
+            rmt_write_items(CH_CIR, manual_pwm_items, NUM_PULSES+1, false);
+            break;
+
+        case 1: // === DEAD PHASE (Silence) ===
+            // Do nothing. 
+            break;
+
+        case 2: // === RED PHASE ===
+            // Fire Red Window and Red PWM immediately
+            rmt_write_items(CH_PR, manual_window_item, 2, false);
+            rmt_write_items(CH_CR, manual_pwm_items, NUM_PULSES+1, false);
+            break;
+
+        case 3: // === DEAD PHASE (Silence) ===
+            // Do nothing.
+            break;
+    }
+
+    // Cycle states: 0 -> 1 -> 2 -> 3 -> 0 ...
+    fsm_state = (fsm_state + 1) % 4;
+}
+
+// =============================================================
+// ----------------------- MAIN SETUP --------------------------
+// =============================================================
 void setup() {
     Serial.begin(115200);
-    delay(300);
+    
+    fillManualBuffers();
+    setupRMT();
 
-    // ============================================================
-    // ***********************  PIR  *******************************
-    // 500us ON, 1500us OFF
-    // ============================================================
-    rmt_config_t cfg_pir = {};
-    cfg_pir.channel = RMT_CHANNEL_0;
-    cfg_pir.gpio_num = (gpio_num_t)PIN_PIR;
-    cfg_pir.mem_block_num = 1;
-    cfg_pir.clk_div = 80;
-    cfg_pir.tx_config.loop_en = false;
-    cfg_pir.tx_config.idle_output_en = true;
-    cfg_pir.tx_config.idle_level = RMT_IDLE_LEVEL_LOW;
-    cfg_pir.rmt_mode = RMT_MODE_TX;
-    rmt_config(&cfg_pir);
-    rmt_driver_install(cfg_pir.channel, 0, 0);
+    // Configure Hardware Timer (1MHz frequency -> 1 tick = 1us)
+    timer = timerBegin(1000000); 
+    timerAttachInterrupt(timer, &onTimerISR);
+    timerAlarm(timer, FSM_TICK_US, true, 0); 
 
-    pir_item[0].level0 = 1;
-    pir_item[0].duration0 = DUTY_US;               // 500us high
-    pir_item[0].level1 = 0;
-    pir_item[0].duration1 = PERIOD_US - DUTY_US;   // 1500us low
-
-    // ============================================================
-    // ***********************  CIR  *******************************
-    // 20 kHz, 500us window → 10 pulses @ 50% duty
-    // ============================================================
-    rmt_config_t cfg_cir = {};
-    cfg_cir.channel = RMT_CHANNEL_1;
-    cfg_cir.gpio_num = (gpio_num_t)PIN_CIR;
-    cfg_cir.mem_block_num = 2;
-    cfg_cir.clk_div = 80;
-    cfg_cir.tx_config.loop_en = false;
-    cfg_cir.tx_config.idle_output_en = true;
-    cfg_cir.tx_config.idle_level = RMT_IDLE_LEVEL_LOW;
-    cfg_cir.rmt_mode = RMT_MODE_TX;
-    rmt_config(&cfg_cir);
-    rmt_driver_install(cfg_cir.channel, 0, 0);
-
-    for (int i = 0; i < MAX_CYCLES; i++) {
-        cir_items[i].level0 = 1;
-        cir_items[i].duration0 = high_us;
-        cir_items[i].level1 = 0;
-        cir_items[i].duration1 = low_us;
-    }
-
-    // trailing low to complete 2ms frame
-    cir_items[MAX_CYCLES].level0 = 0;
-    cir_items[MAX_CYCLES].duration0 = PERIOD_US - DUTY_US;
-    cir_items[MAX_CYCLES].level1 = 0;
-    cir_items[MAX_CYCLES].duration1 = 0;
-
-    // ============================================================
-    // ***********************  PR  *******************************
-    // 1ms low → 500us high → 500us low
-    // ============================================================
-    rmt_config_t cfg_pr = {};
-    cfg_pr.channel = RMT_CHANNEL_2;
-    cfg_pr.gpio_num = (gpio_num_t)PIN_PR;
-    cfg_pr.mem_block_num = 1;
-    cfg_pr.clk_div = 80;
-    cfg_pr.tx_config.loop_en = false;
-    cfg_pr.tx_config.idle_output_en = true;
-    cfg_pr.tx_config.idle_level = RMT_IDLE_LEVEL_LOW;
-    cfg_pr.rmt_mode = RMT_MODE_TX;
-    rmt_config(&cfg_pr);
-    rmt_driver_install(cfg_pr.channel, 0, 0);
-
-    pr_items[0].level0 = 0;
-    pr_items[0].duration0 = START_DELAY_US; // 1ms low
-    pr_items[0].level1 = 1;
-    pr_items[0].duration1 = 500;            // 500us high
-
-    pr_items[1].level0 = 0;
-    pr_items[1].duration0 = END_DELAY_US;   // 500us low
-    pr_items[1].level1 = 0;
-    pr_items[1].duration1 = 0;
-
-    // ============================================================
-    // ***********************  CR  *******************************
-    // 20kHz pulses, begin at 1ms, fixed 50% duty
-    // ============================================================
-    rmt_config_t cfg_cr = {};
-    cfg_cr.channel = RMT_CHANNEL_3;
-    cfg_cr.gpio_num = (gpio_num_t)PIN_CR;
-    cfg_cr.mem_block_num = 2;
-    cfg_cr.clk_div = 80;
-    cfg_cr.tx_config.loop_en = false;
-    cfg_cr.tx_config.idle_output_en = true;
-    cfg_cr.tx_config.idle_level = RMT_IDLE_LEVEL_LOW;
-    cfg_cr.rmt_mode = RMT_MODE_TX;
-    rmt_config(&cfg_cr);
-    rmt_driver_install(cfg_cr.channel, 0, 0);
-
-    for (int i = 0; i < NUM_PULSES; i++) {
-        cr_items[i].level0 = 0;
-        cr_items[i].duration0 = (i == 0) ? START_DELAY_US : low_us;
-        cr_items[i].level1 = 1;
-        cr_items[i].duration1 = high_us;
-    }
-
-    cr_items[NUM_PULSES].level0 = 0;
-    cr_items[NUM_PULSES].duration0 = END_DELAY_US;
-    cr_items[NUM_PULSES].level1 = 0;
-    cr_items[NUM_PULSES].duration1 = 0;
+    Serial.println("FSM System Started @ 50kHz.");
 }
 
 void loop() {
-
-    // ----------- STOP ALL 4 CHANNELS ------------
-    rmt_tx_stop(RMT_CHANNEL_0);
-    rmt_tx_stop(RMT_CHANNEL_1);
-    rmt_tx_stop(RMT_CHANNEL_2);
-    rmt_tx_stop(RMT_CHANNEL_3);
-
-    // ----------- WRITE ITEMS ------------
-    rmt_write_items(RMT_CHANNEL_0, pir_item, 1, false);
-    rmt_write_items(RMT_CHANNEL_1, cir_items, MAX_CYCLES + 1, false);
-    rmt_write_items(RMT_CHANNEL_2, pr_items, 2, false);
-    rmt_write_items(RMT_CHANNEL_3, cr_items, NUM_PULSES + 1, false);
-
-    rmt_wait_tx_done(RMT_CHANNEL_0, portMAX_DELAY);
-    rmt_wait_tx_done(RMT_CHANNEL_1, portMAX_DELAY);
-    rmt_wait_tx_done(RMT_CHANNEL_2, portMAX_DELAY);
-    rmt_wait_tx_done(RMT_CHANNEL_3, portMAX_DELAY);
-
-    // ----------- START ALL CHANNELS TOGETHER ------------
-    rmt_tx_start(RMT_CHANNEL_0, true);
-    rmt_tx_start(RMT_CHANNEL_1, true);
-    rmt_tx_start(RMT_CHANNEL_2, true);
-    rmt_tx_start(RMT_CHANNEL_3, true);
-
-    ets_delay_us(PERIOD_US);
+    delay(1000);
 }
