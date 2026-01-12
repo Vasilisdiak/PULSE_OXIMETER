@@ -135,13 +135,13 @@ void loop() {
         float voltageAC = rawAC * (3.3 / 4095.0);
 
         // 2. AGC Logic (Uses DC signal)
-        // Aim for 1.8V on the DC line
+        // Aim for 1.5V on the DC line
         bool changed = false;
         if (voltageDC > 1.5) {
-            // Temporary limit: Don't go below 50% (was 2%)
+            // Temporary limit: Don't go below 50% (was 5%)
             if (current_duty_percent > 5) { current_duty_percent--; changed = true; } 
         } else if (voltageDC < 1.4) {
-            // Temporary limit: Don't go above 50% (was 90%)
+            // Temporary limit: Don't go above 50% (was 95%)
             if (current_duty_percent < 95) { current_duty_percent++; changed = true; } 
         }
         if (changed) setDutyCycle(current_duty_percent);
