@@ -1,11 +1,14 @@
 #include <Arduino.h>
 
 /* ================= PIN DEFINITIONS ================= */
-#define PIN_RED_LED   19      // RED LED always ON
-#define PIN_ADC_DC    34      // DC level
-#define PIN_ADC_AC    35      // AC amplified signal
+// To turn the Red LED fully ON, we must enable both the Window and the Signal pins
+#define PIN_RED_WIN   19      // The "Window" enable pin
+#define PIN_RED_PWM   14      // The "PWM/Signal" pin
 
-/* ================= FILTER ================= */
+#define PIN_ADC_DC    34      // DC level input
+#define PIN_ADC_AC    35      // AC amplified input
+
+/* ================= FILTER CLASS ================= */
 class LowPass {
   float alpha;
   float y;
@@ -18,50 +21,57 @@ public:
 };
 
 /* ================= GLOBALS ================= */
-LowPass dcFilter(0.01);      // very slow DC tracking
-LowPass acFilter(0.2);       // smooth AC waveform
+// Filters
+LowPass dcFilter(0.01);      // Heavy smoothing for DC
+LowPass acFilter(0.2);       // Light smoothing for AC
 
-float ac_baseline = 0;
+float ac_baseline = 0;       // For removing DC offset from the AC pin
 
 /* ================= SETUP ================= */
 void setup() {
   Serial.begin(115200);
 
-  analogReadResolution(12);
-  analogSetAttenuation(ADC_11db);
+  // ADC Config
+  analogReadResolution(12);       // 0 - 4095
+  analogSetAttenuation(ADC_11db); // Input range 0 - 3.1V
 
-  pinMode(PIN_RED_LED, OUTPUT);
+  // Configure LED Pins
+  pinMode(PIN_RED_WIN, OUTPUT);
+  pinMode(PIN_RED_PWM, OUTPUT);
 
-  // RED always ON (100%)
-  digitalWrite(PIN_RED_LED, HIGH);
+  // --- ACTIVATE PERMANENT RED LIGHT ---
+  // We write HIGH to both to simulate a 100% duty cycle
+  digitalWrite(PIN_RED_WIN, HIGH);
+  digitalWrite(PIN_RED_PWM, HIGH);
 
-  Serial.println("RED LED ALWAYS ON - EXPERIMENTAL MODE");
+  Serial.println("TEST STARTED: Red Window & PWM set to HIGH (Continuous DC Light)");
 }
 
 /* ================= LOOP ================= */
 void loop() {
-
+  // 1. Read Raw Values
   int rawDC = analogRead(PIN_ADC_DC);
   int rawAC = analogRead(PIN_ADC_AC);
 
-  // Convert to voltage (optional)
+  // 2. Convert to Voltage (Optional, for reference)
   float vDC = rawDC * (3.3 / 4095.0);
-  float vAC = rawAC * (3.3 / 4095.0);
 
-  // Slow DC average
-  float dc = dcFilter.step(rawDC);
+  // 3. Filter DC Signal (Pin 34)
+  float cleanDC = dcFilter.step(rawDC);
 
-  // Remove AC offset (simple high-pass)
-  ac_baseline = 0.995 * ac_baseline + 0.005 * rawAC;
+  // 4. Filter AC Signal (Pin 35)
+  // First, find the average of the AC pin to treat it as "0"
+  ac_baseline = (0.995 * ac_baseline) + (0.005 * rawAC);
   float pulse = rawAC - ac_baseline;
-
-  // Smooth AC waveform
+  
+  // Smooth the result
   float cleanAC = acFilter.step(pulse);
 
-  // Plot / debug
-  Serial.print("DC_raw:"); Serial.print(rawDC);
-  Serial.print(" DC_V:"); Serial.print(vDC, 3);
+  // 5. Serial Plotter Output
+  // DC_raw: The actual raw reading from Pin 34
+  // AC_clean: The centered "wiggle" from Pin 35
+  Serial.print("DC_raw:");   Serial.print(rawDC);
   Serial.print(" AC_clean:"); Serial.println(cleanAC);
 
-  delay(5);   // ~200 Hz output
+  delay(5); // Run at ~200Hz
 }
