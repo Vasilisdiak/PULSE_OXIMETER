@@ -36,7 +36,10 @@ rmt_item32_t items_pwm[NUM_PULSES + 1];
 
 volatile int fsm_state = 0;
 hw_timer_t * timer = NULL;
-int current_duty_percent = 85; 
+
+// --- INDEPENDENT DUTY CYCLES ---
+int duty_IR = 85; 
+int duty_Red = 85;
 
 // Storage for BOTH Pins
 volatile int ir_dc_val = 0;
@@ -52,7 +55,6 @@ float final_SpO2 = 0;
 // =============================================================
 // ------------------- SIGNAL SMOOTHING ------------------------
 // =============================================================
-// We still need a little smoothing because raw ADC data is jittery
 class LowPass {
     float alpha, val;
     public:
@@ -63,23 +65,25 @@ class LowPass {
         }
 };
 
-// Filters for Signal Processing
-LowPass avgDC_IR(0.01);    // Slow average for IR DC
-LowPass avgDC_Red(0.01);   // Slow average for Red DC
-LowPass smoothAC_IR(0.2);  // Fast smoothing for IR Heartbeat
-LowPass smoothAC_Red(0.2); // Fast smoothing for Red Heartbeat
-LowPass avgMag_IR(0.02);   // Magnitude tracker
-LowPass avgMag_Red(0.02);  // Magnitude tracker
+// Filters
+LowPass avgDC_IR(0.05);    // Fast DC tracking for AGC
+LowPass avgDC_Red(0.05);   
+LowPass smoothAC_IR(0.2);  
+LowPass smoothAC_Red(0.2); 
+LowPass avgMag_IR(0.02);   
+LowPass avgMag_Red(0.02);  
 
 // =============================================================
 // --------------- RMT & INTERRUPT SETUP -----------------------
 // =============================================================
-void setDutyCycle(int dutyPercent) {
+void loadBufferWithDuty(int dutyPercent) {
   if (dutyPercent < 5) dutyPercent = 5;
   if (dutyPercent > 90) dutyPercent = 90;
+  
   int high_us = (CARRIER_PERIOD * dutyPercent) / 100;
   int low_us  = CARRIER_PERIOD - high_us;
   if (high_us < 1) high_us = 1; if (low_us < 1) low_us = 1;
+  
   for (int i = 0; i < NUM_PULSES; i++) items_pwm[i] = {{{ (uint16_t)high_us, 1, (uint16_t)low_us, 0 }}};
   items_pwm[NUM_PULSES] = {{{ 0, 0, 0, 0 }}};
   items_window[0] = {{{ 500, 1, 0, 0 }}}; items_window[1] = {{{ 0, 0, 0, 0 }}};
@@ -99,21 +103,21 @@ void setupRMT() {
 void IRAM_ATTR onTimerISR() {
   switch (fsm_state) {
     case 0: // START IR
+      loadBufferWithDuty(duty_IR);
       rmt_write_items(CH_IR_WIN, items_window, 2, false);
       rmt_write_items(CH_IR_PWM, items_pwm, NUM_PULSES + 1, false); break;
       
-    case 1: // SAMPLE IR (Mid-Point)
-      // Read BOTH pins now
+    case 1: // SAMPLE IR
       ir_dc_val = analogRead(PIN_ADC_DC); 
       ir_ac_val = analogRead(PIN_ADC_AC); 
       break;
       
     case 4: // START RED
+      loadBufferWithDuty(duty_Red);
       rmt_write_items(CH_RED_WIN, items_window, 2, false);
       rmt_write_items(CH_RED_PWM, items_pwm, NUM_PULSES + 1, false); break;
       
-    case 5: // SAMPLE RED (Mid-Point)
-      // Read BOTH pins now
+    case 5: // SAMPLE RED
       red_dc_val = analogRead(PIN_ADC_DC); 
       red_ac_val = analogRead(PIN_ADC_AC);
       newData = true; 
@@ -129,16 +133,15 @@ void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
   analogReadResolution(12); analogSetAttenuation(ADC_11db);
-  
-  // SETUP BOTH PINS
   pinMode(PIN_ADC_DC, INPUT);
   pinMode(PIN_ADC_AC, INPUT);
   
   setupRMT();
-  setDutyCycle(current_duty_percent);
+  loadBufferWithDuty(85);
+  
   timer = timerBegin(1000000); timerAttachInterrupt(timer, &onTimerISR);
   timerAlarm(timer, FSM_TICK_US, true, 0);
-  Serial.println("System Running. Dual ADC Mode.");
+  Serial.println("System Running. Dual Independent AGC (Target: 1.8V).");
 }
 
 // =============================================================
@@ -153,74 +156,66 @@ void loop() {
   if (newData) {
     newData = false;
 
-    // --- 1. AGC LOGIC (Using DC Pin 34) ---
-    // This keeps the DC offset at ~1.45V so the AC amplifier works best
-    float voltageDC = ir_dc_val * (3.3 / 4095.0);
-    bool changed = false;
+    // --- 1. SIGNAL PROCESSING ---
+    float vDC_IR = ir_dc_val * (3.3 / 4095.0);
+    float vDC_Red = red_dc_val * (3.3 / 4095.0);
+
+    float dc_IR_smooth = avgDC_IR.step(ir_dc_val);
+    float dc_Red_smooth = avgDC_Red.step(red_dc_val);
+
+    // --- 2. INDEPENDENT DUAL AGC (TARGET: 1.8V) ---
+    // If voltage > 1.85V -> Too bright, reduce duty
+    // If voltage < 1.75V -> Too dim, increase duty
     
-    // Target: 1.4V - 1.5V
-    if (voltageDC > 1.5 && current_duty_percent > 5) { current_duty_percent--; changed = true; }
-    else if (voltageDC < 1.4 && current_duty_percent < 95) { current_duty_percent++; changed = true; }
-    if (changed) setDutyCycle(current_duty_percent);
+    // --> Control IR LED
+    if (vDC_IR > 1 && duty_IR > 2) duty_IR--;      
+    else if (vDC_IR < 0.95 && duty_IR < 90) duty_IR++; 
 
-    // --- 2. SIGNAL PROCESSING ---
-    // Get smoothed DC baselines (from Pin 34)
-    float dc_IR = avgDC_IR.step(ir_dc_val);
-    float dc_Red = avgDC_Red.step(red_dc_val);
+    // --> Control RED LED
+    if (vDC_Red > 1 && duty_Red > 2) duty_Red--;      
+    else if (vDC_Red < 0.95 && duty_Red < 90) duty_Red++; 
 
-    // Get smoothed AC Pulse (from Hardware Pin 35)
-    // NOTE: Pin 35 is centered around Vref/2 usually. 
-    // We remove the static average to just get the "wiggle"
+    // --- 3. AC SIGNAL PROCESSING ---
     static float ac_baseline_ir = 0;
     static float ac_baseline_red = 0;
     
-    // Simple high-pass to center the hardware AC signal at 0
     ac_baseline_ir = (0.95 * ac_baseline_ir) + (0.05 * ir_ac_val);
     ac_baseline_red = (0.95 * ac_baseline_red) + (0.05 * red_ac_val);
     
     float pulse_IR = ir_ac_val - ac_baseline_ir;
     float pulse_Red = red_ac_val - ac_baseline_red;
 
-    // Smooth the pulse for plotting
     float clean_IR = smoothAC_IR.step(pulse_IR);
     float clean_Red = smoothAC_Red.step(pulse_Red);
 
-    // Track Magnitude for SpO2 Calc (Mean Absolute Deviation)
     float mag_IR = avgMag_IR.step(abs(pulse_IR));
     float mag_Red = avgMag_Red.step(abs(pulse_Red));
 
-    // --- 3. BPM CALCULATION ---
-    // Threshold crossing detection on the IR Pulse
-    // If pulse rises above 2x the average magnitude, count a beat
+    // --- 4. BPM DETECTION ---
     if (clean_IR > mag_IR * 1.5 && (millis() - last_beat_time > 300)) {
-       // Debounce: ensure pulse is going UP
-       if (clean_IR > bpm_buffer[bpm_idx]) { // simple check
+       if (clean_IR > 20) { 
            unsigned long time_now = millis();
            float instant_bpm = 60000.0 / (time_now - last_beat_time);
            last_beat_time = time_now;
     
-           // Average last 5 beats
-           bpm_buffer[bpm_idx] = instant_bpm;
-           bpm_idx = (bpm_idx + 1) % 5;
-           float bpm_sum = 0; for(int i=0; i<5; i++) bpm_sum += bpm_buffer[i];
-           final_BPM = bpm_sum / 5.0;
+           if(instant_bpm > 40 && instant_bpm < 180) {
+             bpm_buffer[bpm_idx] = instant_bpm;
+             bpm_idx = (bpm_idx + 1) % 5;
+             float bpm_sum = 0; for(int i=0; i<5; i++) bpm_sum += bpm_buffer[i];
+             final_BPM = bpm_sum / 5.0;
+           }
        }
     }
 
-    // --- 4. SpO2 CALCULATION ---
-    // Formula: R = (AC_red / DC_red) / (AC_ir / DC_ir)
+    // --- 5. SpO2 CALCULATION ---
     if (millis() - last_spo2_calc > 500) {
       last_spo2_calc = millis();
       
-      // Safety: Only calc if finger is present (DC > 0.5V)
-      if (voltageDC > 0.5) {
-          float Ratio = (mag_Red / dc_Red) / (mag_IR / dc_IR);
-          
-          // Empirical Curve: SpO2 = 110 - 25 * R (Adjusted for typical hardware)
-          // You may need to tune these numbers: 110 and 25
+      // Ensure we have a valid signal before calculating
+      if (vDC_IR > 0.5) {
+          float Ratio = (mag_Red / dc_Red_smooth) / (mag_IR / dc_IR_smooth);
           float calc_spo2 = 110.0 - (25.0 * Ratio);
           
-          // Clamp
           if(calc_spo2 > 100) calc_spo2 = 100;
           if(calc_spo2 < 70) calc_spo2 = 70;
           
@@ -230,10 +225,14 @@ void loop() {
       }
     }
 
-    // --- 5. PLOTTING ---
+    // --- 6. PLOTTING ---
     Serial.print("BPM:"); Serial.print(final_BPM);
     Serial.print(" SpO2:"); Serial.print(final_SpO2);
-    // Plot the Hardware AC Signal
+    
+    // Duty Cycle Feedback
+    Serial.print(" IR_Duty:"); Serial.print(duty_IR);
+    Serial.print(" Red_Duty:"); Serial.print(duty_Red);
+
     Serial.print(" Pulse_Wave:"); Serial.println(clean_IR); 
   }
   delay(5);
