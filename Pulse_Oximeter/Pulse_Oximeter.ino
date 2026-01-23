@@ -2,11 +2,19 @@
 #include <Arduino.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
+#include <Wire.h> 
+#include <LiquidCrystal_I2C.h>
+
+// =============================================================
+// -------------------- LCD CONFIGURATION ----------------------
+// =============================================================
+// Default I2C Address is usually 0x27 or 0x3F
+LiquidCrystal_I2C lcd(0x27, 16, 2);  
 
 // =============================================================
 // -------------------- PIN DEFINITIONS ------------------------
 // =============================================================
-#define PIN_IR_WIN    22 
+#define PIN_IR_WIN    23 
 #define PIN_IR_PWM    15 
 #define PIN_RED_WIN   19 
 #define PIN_RED_PWM   14 
@@ -52,7 +60,7 @@ float final_BPM = 0;
 float final_SpO2 = 0;
 
 // =============================================================
-// ------------------- NEW SMART ENVELOPE ----------------------
+// ------------------- SMART FILTERS ---------------------------
 // =============================================================
 
 class LowPass {
@@ -66,54 +74,29 @@ class LowPass {
         }
 };
 
-// NEW CLASS: Replaces AmplitudeTracker
-// Uses Asymmetrical Smoothing to handle Rise vs Fall naturally
 class SmartEnvelope {
     float val;
-    float attack;  // Speed when going UP
-    float release; // Speed when going DOWN
+    float attack;  
+    float release; 
     public:
         SmartEnvelope(float att, float rel) { 
-            val = 0; 
-            attack = att; 
-            release = rel; 
+            val = 0; attack = att; release = rel; 
         }
-        
         void reset() { val = 0; }
         
         float step(float ac_input) {
-            // We only care about the magnitude (absolute height)
             float abs_input = abs(ac_input);
-            
-            if (abs_input > val) {
-                // RISING (Signal is bigger than tracker)
-                // Use Attack speed. 
-                // Formula: val = val + speed * (target - val)
-                val = val + attack * (abs_input - val);
-            } else {
-                // FALLING (Signal is smaller than tracker)
-                // Use Release speed.
-                val = val - release * (val - abs_input);
-            }
-            
-            // The P2P is roughly 2x the Envelope (Peak-to-Peak vs Peak)
-            // We multiply by 2.0 to restore the full height number
+            if (abs_input > val) val = val + attack * (abs_input - val);
+            else val = val - release * (val - abs_input);
             return val * 2.0; 
         }
 };
 
-// --- AGC FILTERS ---
+// Filters
 LowPass agc_filter_IR(0.05);   
 LowPass agc_filter_Red(0.05);
-
-// --- SIGNAL CENTER FILTERS ---
-// 0.001 is fast enough to track bias, slow enough for 1Hz
 LowPass ac_center_IR(0.001);     
 LowPass ac_center_Red(0.001);
-
-// --- NEW TRACKERS ---
-// Attack 0.05: Fast rise (~0.1s) but smooths noise spikes (No Overshoot)
-// Release 0.0003: Slow fall to handle 1Hz gaps, but exponential drop (No "Stuck" feeling)
 SmartEnvelope env_IR(0.05, 0.0003); 
 SmartEnvelope env_Red(0.05, 0.0003);
 
@@ -178,11 +161,18 @@ void setup() {
   pinMode(PIN_ADC_IR_SIG, INPUT);   
   pinMode(PIN_ADC_RED_SIG, INPUT);  
   
+  // LCD SETUP
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("System Booting..");
+
   setupRMT();
   
   timer = timerBegin(1000000); timerAttachInterrupt(timer, &onTimerISR);
   timerAlarm(timer, FSM_TICK_US, true, 0);
-  Serial.println("System Running: Smart Envelope Mode.");
+  Serial.println("System Running: LCD Active.");
 }
 
 // =============================================================
@@ -227,21 +217,16 @@ void loop() {
        if (FB_Red_Smooth > FB_IR_Smooth) duty_Red--;
     }
 
-    // 3. SpO2 LOGIC (Using Smart Envelope)
-    
-    // A. Center Signals
+    // 3. SpO2 Processing
     float center_IR = ac_center_IR.step(Sig_IR_mV);
     float center_Red = ac_center_Red.step(Sig_Red_mV);
-    
     float AC_IR = Sig_IR_mV - center_IR;
     float AC_Red = Sig_Red_mV - center_Red;
 
-    // B. Calculate Envelope (Replaces P2P)
-    // This will now rise smoothly (no overshoot) and fall exponentially (faster feel)
     float P2P_IR = env_IR.step(AC_IR);
     float P2P_Red = env_Red.step(AC_Red);
 
-    // C. BPM
+    // 4. BPM
     if (AC_IR > 50.0 && !beat_latch) {
         beat_latch = true;
         unsigned long now = millis();
@@ -253,38 +238,64 @@ void loop() {
     }
     if (AC_IR < -50.0) beat_latch = false;
 
-    // D. Output
-    static unsigned long last_calc = 0;
-    if (millis() - last_calc > 100) {
-        last_calc = millis();
+    // 5. Output Handler (Serial + LCD)
+    static unsigned long last_update = 0;
+    
+    // Update every 100ms for Math/Serial
+    if (millis() - last_update > 100) {
+        last_update = millis();
 
         if (P2P_IR > 20.0) {
             float Norm_Red = P2P_Red / STAGE2_BIAS_MV;
             float Norm_IR = P2P_IR / STAGE2_BIAS_MV;
             float R = Norm_Red / Norm_IR;
-
             float calc = 110.0 - (25.0 * R);
+            
             if (calc > 100) calc = 100;
             if (calc < 60) calc = 60;
             
             final_SpO2 = (final_SpO2 * 0.9) + (calc * 0.1);
 
+            // SERIAL
             Serial.print("BPM:"); Serial.print(final_BPM);
             Serial.print(" SpO2:"); Serial.print(final_SpO2);
-           // Serial.print(" Pulse_Wave:"); Serial.print(AC_IR);
+            Serial.print(" Pulse_Wave:"); Serial.println(AC_IR);
             
-            // Check responsiveness:
-            Serial.print(" | P2P_IR:"); Serial.print(P2P_IR);
-            Serial.print(" P2P_Red:"); Serial.print(P2P_Red);
-            Serial.print(" Duty_IR:"); Serial.print(duty_IR);
-            Serial.print(" Duty_Red:"); Serial.print(duty_Red);
-            Serial.println();
+            // LCD UPDATE (Every 500ms to avoid flicker)
+            static unsigned long lcd_timer = 0;
+            if (millis() - lcd_timer > 500) {
+                lcd_timer = millis();
+                lcd.clear();
+                
+                // Row 0: SpO2
+                lcd.setCursor(0, 0);
+                lcd.print("SPO2 = ");
+                lcd.print((int)final_SpO2);
+                lcd.print("%");
+
+                // Row 1: BPM
+                lcd.setCursor(0, 1);
+                lcd.print("Heart rate = ");
+                lcd.print((int)final_BPM);
+            }
+            
         } else {
             Serial.println("Signal_Low"); 
             final_BPM = 0;
             final_SpO2 = 0;
             if(duty_IR < 85) duty_IR++;
             if(duty_Red < 85) duty_Red++;
+
+            // LCD Message for No Finger
+            static unsigned long lcd_timer = 0;
+            if (millis() - lcd_timer > 500) {
+                lcd_timer = millis();
+                lcd.clear();
+                lcd.setCursor(0, 0);
+                lcd.print("Place Finger");
+                lcd.setCursor(0, 1);
+                lcd.print("Signal Low...");
+            }
         }
     }
   }
